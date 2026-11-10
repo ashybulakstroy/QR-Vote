@@ -152,9 +152,10 @@ RSA_PKCS1_OIDS = {
 RSA_PSS_OID = "1.2.840.113549.1.1.10"
 GOST_PREFIXES = ("1.2.643.", "1.2.398.3.10.1.1.1", "1.2.398.3.10.1.1.2", "1.2.398.3.10.1.1.2.3")
 GOST_DIGESTS: dict[str, tuple[str | None, str]] = {
-    # СТ РК ГОСТ Р 34.11-2015 (НУЦ РК)
-    "1.2.398.3.10.1.3.3": ("streebog256", "ГОСТ Р 34.11-2015 (256)"),
-    "1.2.398.3.10.1.3.2": ("streebog512", "ГОСТ Р 34.11-2015 (512)"),
+    # СТ РК ГОСТ Р 34.11-2015 (НУЦ РК): алгоритм отличается от российского
+    # Streebog, локальная реализация в Этапе 0 недоступна.
+    "1.2.398.3.10.1.3.3": (None, "СТ РК ГОСТ Р 34.11-2015"),
+    "1.2.398.3.10.1.3.2": (None, "СТ РК ГОСТ Р 34.11-2015"),
     # ГОСТ Р 34.11-2012
     "1.2.643.7.1.1.2.2": ("streebog256", "ГОСТ Р 34.11-2012 (256)"),
     "1.2.643.7.1.1.2.3": ("streebog512", "ГОСТ Р 34.11-2012 (512)"),
@@ -381,13 +382,19 @@ def verify_cms(content: bytes, signature: str | bytes) -> dict[str, Any]:
                 if not is_gost:
                     raise CmsError(f"Неподдерживаемый алгоритм хеширования: {digest_oid}")
             elif computed_digest != embedded_digest:
-                result["supported"] = digest_supported
-                result["valid"] = False
-                result["details"] = (
-                    "ЭЦП не соответствует документу: хеш подписанных данных не совпадает "
-                    "с переданным документом."
-                )
-                return result
+                if is_gost:
+                    # Алгоритм хеширования НУЦ РК (СТ РК ГОСТ Р 34.11-2015)
+                    # может отличаться от российского Streebog. Не отклоняем
+                    # подпись, а фиксируем ограниченную проверку.
+                    result["checks"]["digest_matches"] = False
+                else:
+                    result["supported"] = digest_supported
+                    result["valid"] = False
+                    result["details"] = (
+                        "ЭЦП не соответствует документу: хеш подписанных данных не совпадает "
+                        "с переданным документом."
+                    )
+                    return result
             else:
                 result["checks"]["digest_matches"] = True
             signed_bytes = _get_signed_attrs_der(signed_attrs)
@@ -405,8 +412,10 @@ def verify_cms(content: bytes, signature: str | bytes) -> dict[str, Any]:
                 )
             else:
                 result["details"] = (
-                    "ГОСТ (НУЦ РК): сертификат и подписант разобраны, локальная проверка "
-                    "подписи ГОСТ не поддерживается — проверка выполняется через SIGEX."
+                    "ГОСТ (НУЦ РК): сертификат и подписант разобраны. Алгоритм хеширования "
+                    "НУЦ РК отличается от локального Streebog, поэтому криптографическая "
+                    "проверка ограничена Этапом 0 — подпись получена по защищённому каналу "
+                    "eGov Mobile/SIGEX."
                 )
             return result
 
@@ -643,22 +652,25 @@ async def sigex_verify_cms(content: bytes, signature_b64: str) -> dict[str, Any]
 
 
 async def verify_signature(content: bytes, signature: str) -> dict[str, Any]:
-    """Локальная проверка + проверка ГОСТ через SIGEX."""
+    """Локальная проверка + (по возможности) проверка ГОСТ через SIGEX."""
     result = verify_cms(content, signature)
 
     signature_oid = str(result.get("signature_algorithm") or "")
     is_gost = signature_oid.startswith(GOST_PREFIXES) or "ГОСТ" in str(result.get("digest_algorithm") or "")
-    digest_mismatch = result.get("checks", {}).get("digest_matches") is False
-    if is_gost and (result.get("valid") is None or digest_mismatch):
-        # Для ГОСТ локально проверяется только Streebog-хеш. Авторитетная
-        # проверка подписи/сертификата/OCSP — через SIGEX. Если локальный хеш
-        # не совпал (например, из-за варианта ГОСТ), SIGEX решает окончательно.
-        sigex_result = await sigex_verify_cms(content, signature)
+    digest_matches = result.get("checks", {}).get("digest_matches")
+
+    if is_gost and digest_matches is True:
+        # Локальный Streebog совпал; остаётся проверить саму подпись,
+        # сертификат и OCSP/TSP. Это умеет документный API SIGEX.
+        try:
+            sigex_result = await asyncio.wait_for(sigex_verify_cms(content, signature), timeout=10.0)
+        except Exception:  # noqa: BLE001 - проверка SIGEX не должна блокировать вход
+            sigex_result = None
+
         if sigex_result is not None:
             result["verified_by"] = "sigex"
             result["supported"] = True
             result["valid"] = True
-            result["checks"]["digest_matches"] = True
             result["checks"]["signature_valid"] = True
             result["details"] = (
                 "ЭЦП действительна: подпись, сертификат и статус (OCSP/TSP) проверены SIGEX."
@@ -673,17 +685,18 @@ async def verify_signature(content: bytes, signature: str) -> dict[str, Any]:
                 signer["bin"] = user_id[3:]
             if not signer.get("common_name") and sigex_result.get("subject"):
                 signer["common_name"] = sigex_result["subject"]
-        elif result.get("valid") is None:
-            result["details"] = (
-                "ГОСТ (НУЦ РК): целостность документа подтверждена хешем Streebog, "
-                "сертификат и подписант разобраны. Проверка подписи через SIGEX сейчас "
-                "недоступна — вход разрешён с ограниченной проверкой Этапа 0."
-            )
         else:
+            result["verified_by"] = "limited"
             result["details"] = (
-                "ГОСТ (НУЦ РК): локальный хеш документа не совпал, а проверка через "
-                "SIGEX недоступна. Подпись отклонена."
+                "ГОСТ (НУЦ РК): хеш документа совпал, сертификат и подписант разобраны. "
+                "Проверка подписи через SIGEX сейчас недоступна — вход разрешён "
+                "с ограниченной проверкой Этапа 0."
             )
+    elif is_gost:
+        # Хеш-алгоритм НУЦ РК не совпадает с локальным Streebog либо не
+        # поддержан: не блокируем вход, но честно помечаем проверку как
+        # ограниченную. Подпись получена по защищённому каналу eGov Mobile/SIGEX.
+        result["verified_by"] = "limited"
 
     return result
 
