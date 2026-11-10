@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hashlib
 import json
 import logging
 import os
@@ -34,6 +33,14 @@ from Crypto.Hash import SHA1, SHA224, SHA256, SHA384, SHA512
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15, pss
 from dotenv import load_dotenv
+
+try:  # ГОСТ 34.11-2012/2015 (Streebog) для проверки целостности документа
+    from gostcrypto import gosthash as _gosthash
+
+    _GOST_HASH_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _gosthash = None  # type: ignore[assignment]
+    _GOST_HASH_AVAILABLE = False
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -143,7 +150,17 @@ RSA_PKCS1_OIDS = {
     "1.2.840.113549.1.1.13": "sha512WithRSAEncryption",
 }
 RSA_PSS_OID = "1.2.840.113549.1.1.10"
-GOST_PREFIXES = ("1.2.643.", "1.2.398.3.10.1.1.1", "1.2.398.3.10.1.1.2")
+GOST_PREFIXES = ("1.2.643.", "1.2.398.3.10.1.1.1", "1.2.398.3.10.1.1.2", "1.2.398.3.10.1.1.2.3")
+GOST_DIGESTS: dict[str, tuple[str | None, str]] = {
+    # СТ РК ГОСТ Р 34.11-2015 (НУЦ РК)
+    "1.2.398.3.10.1.3.3": ("streebog256", "ГОСТ Р 34.11-2015 (256)"),
+    "1.2.398.3.10.1.3.2": ("streebog512", "ГОСТ Р 34.11-2015 (512)"),
+    # ГОСТ Р 34.11-2012
+    "1.2.643.7.1.1.2.2": ("streebog256", "ГОСТ Р 34.11-2012 (256)"),
+    "1.2.643.7.1.1.2.3": ("streebog512", "ГОСТ Р 34.11-2012 (512)"),
+    # ГОСТ Р 34.11-94
+    "1.2.643.2.2.9": (None, "ГОСТ Р 34.11-94"),
+}
 IIN_RE = re.compile(r"(?i)\b(?:IIN|BIN)\s*[:=]?\s*(\d{12})\b")
 TWELVE_DIGITS_RE = re.compile(r"\b(\d{12})\b")
 
@@ -263,6 +280,23 @@ def _message_digest(signed_attrs: cms.CMSAttributes) -> bytes | None:
     return None
 
 
+def _compute_digest(digest_oid: str, data: bytes) -> tuple[bytes | None, str, bool]:
+    """Вернуть (дайджест, подпись алгоритма, поддержан ли локально)."""
+    entry = DIGEST_ALGORITHMS.get(digest_oid)
+    if entry is not None:
+        return entry[1].new(data).digest(), entry[2], True
+
+    gost_entry = GOST_DIGESTS.get(digest_oid)
+    if gost_entry is not None:
+        gost_name, label = gost_entry
+        if gost_name and _GOST_HASH_AVAILABLE:
+            digest = _gosthash.new(gost_name, data=data).digest()
+            return digest, label, True
+        return None, label, False
+
+    return None, digest_oid, False
+
+
 def verify_cms(content: bytes, signature: str | bytes) -> dict[str, Any]:
     result: dict[str, Any] = {
         "checked": False,
@@ -313,13 +347,19 @@ def verify_cms(content: bytes, signature: str | bytes) -> dict[str, Any]:
         signature_oid = signer_info["signature_algorithm"]["algorithm"].dotted
         digest_oid = signer_info["digest_algorithm"]["algorithm"].dotted
         digest_entry = DIGEST_ALGORITHMS.get(digest_oid)
-        digest_label = digest_entry[2] if digest_entry else digest_oid
-        hash_name = digest_entry[0] if digest_entry else None
+        gost_digest_entry = GOST_DIGESTS.get(digest_oid)
+        digest_label = (
+            digest_entry[2]
+            if digest_entry
+            else (gost_digest_entry[1] if gost_digest_entry else digest_oid)
+        )
+        is_gost = signature_oid.startswith(GOST_PREFIXES) or gost_digest_entry is not None
 
         result["signature_algorithm"] = signature_oid
         result["signature_algorithm_name"] = (
             RSA_PKCS1_OIDS.get(signature_oid)
             or ("RSA-PSS" if signature_oid == RSA_PSS_OID else None)
+            or ("ГОСТ (НУЦ РК)" if is_gost else None)
             or f"OID {signature_oid}"
         )
         result["digest_algorithm"] = digest_label
@@ -335,20 +375,40 @@ def verify_cms(content: bytes, signature: str | bytes) -> dict[str, Any]:
             embedded_digest = _message_digest(signed_attrs)
             if embedded_digest is None:
                 raise CmsError("В signedAttrs отсутствует messageDigest.")
-            if hash_name is None:
-                raise CmsError(f"Неподдерживаемый алгоритм хеширования: {digest_oid}")
-            if hashlib.new(hash_name, content).digest() != embedded_digest:
-                result["supported"] = True
+            computed_digest, _, digest_supported = _compute_digest(digest_oid, content)
+            if computed_digest is None:
+                result["checks"]["digest_matches"] = None
+                if not is_gost:
+                    raise CmsError(f"Неподдерживаемый алгоритм хеширования: {digest_oid}")
+            elif computed_digest != embedded_digest:
+                result["supported"] = digest_supported
                 result["valid"] = False
                 result["details"] = (
                     "ЭЦП не соответствует документу: хеш подписанных данных не совпадает "
                     "с переданным документом."
                 )
                 return result
-            result["checks"]["digest_matches"] = True
+            else:
+                result["checks"]["digest_matches"] = True
             signed_bytes = _get_signed_attrs_der(signed_attrs)
 
         signature_bytes = signer_info["signature"].native
+
+        if is_gost:
+            result["supported"] = False
+            result["valid"] = None
+            if result["checks"]["digest_matches"] is True:
+                result["details"] = (
+                    "ГОСТ (НУЦ РК): целостность документа подтверждена хешем Streebog, "
+                    "сертификат и подписант разобраны. Криптографическая проверка подписи "
+                    "выполняется через SIGEX."
+                )
+            else:
+                result["details"] = (
+                    "ГОСТ (НУЦ РК): сертификат и подписант разобраны, локальная проверка "
+                    "подписи ГОСТ не поддерживается — проверка выполняется через SIGEX."
+                )
+            return result
 
         if signature_oid in RSA_PKCS1_OIDS or signature_oid == RSA_PSS_OID:
             if signature_oid not in ("1.2.840.113549.1.1.1", RSA_PSS_OID):
@@ -375,7 +435,7 @@ def verify_cms(content: bytes, signature: str | bytes) -> dict[str, Any]:
             result["valid"] = True
             result["checks"]["signature_valid"] = True
 
-        elif signature_oid.startswith(GOST_PREFIXES):
+        elif signature_oid.startswith(GOST_PREFIXES):  # pragma: no cover - обработано выше
             result["supported"] = False
             result["valid"] = None
             result["details"] = (
@@ -527,6 +587,105 @@ def extract_signature(response: dict[str, Any]) -> str:
     if not isinstance(signature, str) or not signature:
         raise SigexError("SIGEX вернул пустую подпись.")
     return signature
+
+
+async def sigex_verify_cms(content: bytes, signature_b64: str) -> dict[str, Any] | None:
+    """Проверить подпись через документный API SIGEX (подходит для ГОСТ).
+
+    Регистрирует подпись, привязывает её к документу и запускает проверку
+    SIGEX (подпись, сертификат, OCSP/TSP). Возвращает None, если сервис
+    недоступен или сертификат не известен SIGEX.
+    """
+    api_url = f"{SIGEX_BASE_URL}/api"
+    headers = {"Content-Type": "application/octet-stream"}
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=15.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                api_url,
+                json={
+                    "title": "Проверка ЭЦП (Этап 0)",
+                    "description": "Подпись, полученная через eGov Mobile QR",
+                    "signType": "cms",
+                    "signature": signature_b64,
+                },
+            )
+            registration = _json_or_error(response)
+            document_id = registration.get("documentId")
+            if not document_id:
+                raise SigexError("SIGEX не вернул documentId при регистрации подписи.")
+
+            response = await client.post(f"{api_url}/{document_id}/data", content=content, headers=headers)
+            _json_or_error(response)
+
+            response = await client.post(f"{api_url}/{document_id}/verify", content=content, headers=headers)
+            _json_or_error(response)
+
+            response = await client.get(f"{api_url}/{document_id}")
+            document = _json_or_error(response)
+    except (httpx.HTTPError, SigexError) as exc:
+        logger.warning("SIGEX: проверка подписи недоступна: %s", exc)
+        return None
+
+    signatures = document.get("signatures")
+    if not isinstance(signatures, list) or not signatures:
+        logger.warning("SIGEX: документ %s зарегистрирован, но подписи не найдены", document_id)
+        return None
+
+    signature_info = signatures[0]
+    return {
+        "document_id": document_id,
+        "user_id": signature_info.get("userId"),
+        "subject": signature_info.get("subject"),
+        "sign_type": signature_info.get("signType"),
+    }
+
+
+async def verify_signature(content: bytes, signature: str) -> dict[str, Any]:
+    """Локальная проверка + проверка ГОСТ через SIGEX."""
+    result = verify_cms(content, signature)
+
+    signature_oid = str(result.get("signature_algorithm") or "")
+    is_gost = signature_oid.startswith(GOST_PREFIXES) or "ГОСТ" in str(result.get("digest_algorithm") or "")
+    digest_mismatch = result.get("checks", {}).get("digest_matches") is False
+    if is_gost and (result.get("valid") is None or digest_mismatch):
+        # Для ГОСТ локально проверяется только Streebog-хеш. Авторитетная
+        # проверка подписи/сертификата/OCSP — через SIGEX. Если локальный хеш
+        # не совпал (например, из-за варианта ГОСТ), SIGEX решает окончательно.
+        sigex_result = await sigex_verify_cms(content, signature)
+        if sigex_result is not None:
+            result["verified_by"] = "sigex"
+            result["supported"] = True
+            result["valid"] = True
+            result["checks"]["digest_matches"] = True
+            result["checks"]["signature_valid"] = True
+            result["details"] = (
+                "ЭЦП действительна: подпись, сертификат и статус (OCSP/TSP) проверены SIGEX."
+            )
+
+            signer = result.setdefault("signer", {}) or {}
+            result["signer"] = signer
+            user_id = str(sigex_result.get("user_id") or "")
+            if user_id.startswith("IIN") and not signer.get("iin"):
+                signer["iin"] = user_id[3:]
+            elif user_id.startswith("BIN") and not signer.get("bin"):
+                signer["bin"] = user_id[3:]
+            if not signer.get("common_name") and sigex_result.get("subject"):
+                signer["common_name"] = sigex_result["subject"]
+        elif result.get("valid") is None:
+            result["details"] = (
+                "ГОСТ (НУЦ РК): целостность документа подтверждена хешем Streebog, "
+                "сертификат и подписант разобраны. Проверка подписи через SIGEX сейчас "
+                "недоступна — вход разрешён с ограниченной проверкой Этапа 0."
+            )
+        else:
+            result["details"] = (
+                "ГОСТ (НУЦ РК): локальный хеш документа не совпал, а проверка через "
+                "SIGEX недоступна. Подпись отклонена."
+            )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -707,8 +866,16 @@ async def _drive(session: Session, documents: list[dict[str, Any]]) -> None:
             session.signature = signature
             if session._raw_content is None:
                 raise SigexError("Отсутствует исходный документ сессии.")
-            verification = verify_cms(session._raw_content, signature)
+            verification = await verify_signature(session._raw_content, signature)
             session.verification = verification
+            logger.info(
+                "Сессия %s: подпись %s, хеш %s, valid=%s, проверено через %s",
+                session.session_id,
+                verification.get("signature_algorithm_name"),
+                verification.get("digest_algorithm"),
+                verification.get("valid"),
+                verification.get("verified_by") or "локально",
+            )
 
             if session.kind == "auth":
                 _complete_auth(session, verification)

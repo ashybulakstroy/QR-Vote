@@ -4,4 +4,5 @@ httpx>=0.28.0
 python-dotenv>=1.1.0
 asn1crypto>=1.5.1
 pycryptodome>=3.21.0
+gostcrypto>=1.2.5
 python-multipart>=0.0.20
