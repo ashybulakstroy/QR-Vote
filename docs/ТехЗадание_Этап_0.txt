@@ -1,0 +1,456 @@
+Этап 0: Минимальное веб-приложение для проверки eGov Mobile QR
+
+1. Описание архитектуры и принципа работы
+
+Для интеграции с eGov Mobile QR используется открытый и стандартизированный API шлюз SIGEX (https://egov2.sigex.kz), который выступает мостом между веб-приложением и eGov Mobile через WebSocket / REST API.
+
+Порядок работы кнопки № 1 («Авторизоваться через eGov Mobile»):
+
+Веб-приложение запрашивает создание сессии авторизации в SIGEX.
+
+SIGEX возвращает QR-код (в виде Data URL/SVG) и идентификатор сессии.
+
+Пользователь сканирует QR-код через мобильное приложение eGov Mobile.
+
+После подтверждения на сервере получаем подпись одноразового Auth-токена и сертификат пользователя, из которого извлекается подтверждённое ФИО и ИИН.
+
+Порядок работы кнопки № 2 («Подписать тестовый голос»):
+
+Сервер формирует JSON-документ следующей структуры:
+
+{
+  "poll_name": "Тестовое голосование № 1",
+  "question": "Согласны ли вы с предложенным решением?",
+  "answer": "За",
+  "user_fullname": "<ФИО авторизованного пользователя>",
+  "doc_id": "<UUIDv4>",
+  "created_at": "<ISO-timestamp>"
+}
+
+
+Документ отправляется на подпись через eGov Mobile QR.
+
+После подписи пользователь получает статус, а сервер сохраняет полученную подпись CMS (PKCS#7) и исходный документ.
+
+Выполняется автоматическая криптографическая проверка подлинности ЭЦП.
+
+2. Структура минимального веб-приложения
+
+requirements.txt
+
+fastapi>=0.110.0
+uvicorn>=0.28.0
+httpx>=0.27.0
+jinja2>=3.1.3
+python-multipart>=0.0.9
+
+
+main.py (Серверная часть FastAPI)
+
+import os
+import uuid
+import json
+import base64
+from datetime import datetime, timezone
+from typing import Dict, Any
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+import httpx
+
+app = FastAPI(title="eGov Mobile QR Stage 0 Verification")
+
+# Шаблоны HTML
+templates = Jinja2Templates(directory="templates")
+
+# Базовый URL для интеграции с SIGEX QR API
+SIGEX_BASE_URL = "https://egov2.sigex.kz/api"
+
+# Временное хранилище сессий в памяти (для Этапа 0)
+SESSIONS_DB: Dict[str, Dict[str, Any]] = {}
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Главная и единственная страница ТЗ Этапа 0."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.post("/api/auth/qr-init")
+async def init_auth_qr():
+    """
+    Кнопка № 1: Инициализация сессии авторизации и получение QR-кода.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            # Запрос на создание QR для авторизации
+            response = await client.post(
+                f"{SIGEX_BASE_URL}/egovQR/qr-code",
+                json={
+                    "description": "Авторизация в системе голосования",
+                    "type": "auth"
+                },
+                timeout=10.0
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Ошибка SIGEX: {response.text}")
+            
+            data = response.json()
+            qr_code_data = data.get("qrCode") # Base64 Image или Data URL
+            qr_session_id = data.get("qrSessionId")
+            
+            # Фиксируем сессию локально
+            SESSIONS_DB[qr_session_id] = {
+                "status": "PENDING",
+                "type": "auth",
+                "user_fullname": None,
+                "iin": None
+            }
+
+            return JSONResponse({
+                "qrCode": qr_code_data,
+                "qrSessionId": qr_session_id,
+                "eGovMobileLaunchUrl": data.get("eGovMobileLaunchUrl")
+            })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auth/qr-status/{qr_session_id}")
+async def check_auth_status(qr_session_id: str):
+    """Проверка статуса сканирования и авторизации в eGov Mobile."""
+    if qr_session_id not in SESSIONS_DB:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SIGEX_BASE_URL}/egovQR/qr-status/{qr_session_id}",
+                timeout=10.0
+            )
+            
+            if response.status_code != 200:
+                return JSONResponse({"status": "PENDING"})
+
+            res_data = response.json()
+            status = res_data.get("status")
+
+            if status == "COMPLETED":
+                # Извлекаем подтвержденные данные гражданина
+                user_fullname = res_data.get("subject", {}).get("commonName", "Неизвестный Гражданин")
+                iin = res_data.get("subject", {}).get("iin")
+                
+                SESSIONS_DB[qr_session_id]["status"] = "COMPLETED"
+                SESSIONS_DB[qr_session_id]["user_fullname"] = user_fullname
+                SESSIONS_DB[qr_session_id]["iin"] = iin
+
+                return JSONResponse({
+                    "status": "COMPLETED",
+                    "user_fullname": user_fullname,
+                    "iin": iin
+                })
+
+            return JSONResponse({"status": status})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sign/qr-init")
+async def init_sign_qr(payload: Dict[str, str]):
+    """
+    Кнопка № 2: Формирование собственного документа и отправка на подпись в eGov Mobile QR.
+    """
+    user_fullname = payload.get("user_fullname", "Иванов Иван Иванович")
+
+    # Формирование уникального электронного документа по требования ТЗ 0.2
+    doc_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    
+    document_payload = {
+        "poll_name": "Тестовое голосование № 1",
+        "question": "Согласны ли вы с предложенным решением?",
+        "answer": "За",
+        "user_fullname": user_fullname,
+        "doc_id": doc_id,
+        "created_at": created_at
+    }
+
+    raw_doc_bytes = json.dumps(document_payload, ensure_ascii=False, indent=2).encode("utf-8")
+    doc_base64 = base64.b64encode(raw_doc_bytes).decode("utf-8")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # Отправляем документ на регистрацию подписи в eGov QR
+            response = await client.post(
+                f"{SIGEX_BASE_URL}/egovQR/qr-code",
+                json={
+                    "description": f"Подписание бюллетеня № {doc_id[:8]}",
+                    "type": "sign",
+                    "data": doc_base64
+                },
+                timeout=10.0
+            )
+
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Ошибка SIGEX: {response.text}")
+
+            data = response.json()
+            qr_session_id = data.get("qrSessionId")
+
+            # Храним документ для последующей сверки подписи
+            SESSIONS_DB[qr_session_id] = {
+                "status": "PENDING",
+                "type": "sign",
+                "document": document_payload,
+                "raw_bytes": doc_base64,
+                "signature": None
+            }
+
+            return JSONResponse({
+                "qrCode": data.get("qrCode"),
+                "qrSessionId": qr_session_id,
+                "document": document_payload
+            })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sign/qr-status/{qr_session_id}")
+async def check_sign_status(qr_session_id: str):
+    """Проверка получения ЭЦП и вызов криптографической валидации."""
+    if qr_session_id not in SESSIONS_DB:
+        raise HTTPException(status_code=404, detail="Сессия подписи не найдена")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SIGEX_BASE_URL}/egovQR/qr-status/{qr_session_id}",
+                timeout=10.0
+            )
+
+            if response.status_code != 200:
+                return JSONResponse({"status": "PENDING"})
+
+            res_data = response.json()
+            status = res_data.get("status")
+
+            if status == "COMPLETED":
+                cms_signature = res_data.get("signature")
+                
+                # Сохраняем подпись
+                SESSIONS_DB[qr_session_id]["status"] = "COMPLETED"
+                SESSIONS_DB[qr_session_id]["signature"] = cms_signature
+
+                # Криптографическая проверка ЭЦП
+                verification_result = await verify_signature_cryptographically(
+                    SESSIONS_DB[qr_session_id]["raw_bytes"], 
+                    cms_signature
+                )
+
+                return JSONResponse({
+                    "status": "COMPLETED",
+                    "signature": cms_signature[:60] + "...",  # Сокращённая демонстрация
+                    "full_signature": cms_signature,
+                    "verification": verification_result,
+                    "document": SESSIONS_DB[qr_session_id]["document"]
+                })
+
+            return JSONResponse({"status": status})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def verify_signature_cryptographically(doc_base64: str, cms_signature: str) -> Dict[str, Any]:
+    """
+    Проверка действительности подписи и её соответствия исходному документу через SIGEX/NCALayer API.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{SIGEX_BASE_URL}/verify",
+                json={
+                    "data": doc_base64,
+                    "signature": cms_signature
+                },
+                timeout=10.0
+            )
+            if resp.status_code == 200:
+                res = resp.json()
+                return {
+                    "valid": res.get("valid", True),
+                    "signer_subject": res.get("subject"),
+                    "details": "ЭЦП действительна и полностью соответствует сформированному документу."
+                }
+            else:
+                return {
+                    "valid": False,
+                    "details": f"Ошибка проверки подписи: {resp.text}"
+                }
+    except Exception as e:
+        return {"valid": False, "details": f"Исключение при проверке: {str(e)}"}
+
+
+templates/index.html (Веб-интерфейс проверки)
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Этап 0: Проверка eGov Mobile QR</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 30px; background: #f4f6f9; color: #333; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); margin-bottom: 20px; max-width: 650px; }
+        h1 { font-size: 20px; margin-top: 0; color: #1a252f; }
+        button { background: #0056b3; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; font-size: 15px; margin-right: 10px; font-weight: 600; }
+        button:disabled { background: #a0bce0; cursor: not-allowed; }
+        .qr-box { margin-top: 15px; text-align: center; display: none; }
+        .qr-box img { max-width: 250px; border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: white; }
+        .status { margin-top: 15px; padding: 12px; border-radius: 6px; font-size: 14px; }
+        .status.info { background: #e8f4fd; color: #1d6fbf; }
+        .status.success { background: #e6f9ed; color: #1e7e34; }
+        pre { background: #272822; color: #f8f8f2; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h1>Этап 0: Тестовый стенд eGov Mobile QR</h1>
+    <p>Проверка реальной авторизации и подписи документа через мобильное приложение eGov Mobile.</p>
+
+    <!-- КНОПКА № 1 -->
+    <div>
+        <button id="btnAuth" onclick="startAuth()">Кнопка № 1 — Авторизоваться через eGov Mobile</button>
+    </div>
+    
+    <div id="authQrBox" class="qr-box">
+        <p>Отсканируйте QR-код в приложении <b>eGov Mobile</b>:</p>
+        <img id="authQrImg" src="" alt="eGov QR Code" />
+        <div id="authStatus" class="status info">Ожидание сканирования...</div>
+    </div>
+    
+    <div id="userInfo" style="display:none; margin-top: 15px;" class="status success">
+        <b>Авторизация успешна!</b><br>
+        ФИО: <span id="userFullName">-</span><br>
+        ИИН: <span id="userIIN">-</span>
+    </div>
+</div>
+
+<div class="card" id="signCard" style="opacity: 0.5; pointer-events: none;">
+    <h1>Подписание тестового документа</h1>
+    
+    <!-- КНОПКА № 2 -->
+    <button id="btnSign" onclick="startSigning()">Кнопка № 2 — Подписать тестовый голос</button>
+
+    <div id="signQrBox" class="qr-box">
+        <p>Подтвердите подписание документа в <b>eGov Mobile</b>:</p>
+        <img id="signQrImg" src="" alt="Sign QR Code" />
+        <div id="signStatus" class="status info">Ожидание подписи...</div>
+    </div>
+
+    <div id="signResult" style="display:none; margin-top: 15px;">
+        <h3>Результат проверки ЭЦП:</h3>
+        <div class="status success" id="cryptoStatus">Подпись подлинная и действительная!</div>
+        <h4>Сформированный документ:</h4>
+        <pre id="jsonDoc"></pre>
+        <h4>Полученная подпись (CMS Base64):</h4>
+        <pre id="cmsSignature"></pre>
+    </div>
+</div>
+
+<script>
+    let currentAuthUser = null;
+    let pollInterval = null;
+
+    async function startAuth() {
+        document.getElementById('btnAuth').disabled = true;
+        document.getElementById('authQrBox').style.display = 'block';
+        
+        const res = await fetch('/api/auth/qr-init', { method: 'POST' });
+        const data = await res.json();
+        
+        document.getElementById('authQrImg').src = data.qrCode;
+        
+        // Опрос состояния сессии
+        pollInterval = setInterval(async () => {
+            const stRes = await fetch(`/api/auth/qr-status/${data.qrSessionId}`);
+            const stData = await stRes.json();
+            
+            if (stData.status === 'COMPLETED') {
+                clearInterval(pollInterval);
+                document.getElementById('authQrBox').style.display = 'none';
+                document.getElementById('userInfo').style.display = 'block';
+                document.getElementById('userFullName').innerText = stData.user_fullname;
+                document.getElementById('userIIN').innerText = stData.iin || 'Получен';
+                
+                currentAuthUser = stData.user_fullname;
+                
+                // Разблокируем Кнопку № 2
+                document.getElementById('signCard').style.opacity = '1';
+                document.getElementById('signCard').style.pointerEvents = 'auto';
+            }
+        }, 2000);
+    }
+
+    async function startSigning() {
+        document.getElementById('btnSign').disabled = true;
+        document.getElementById('signQrBox').style.display = 'block';
+
+        const res = await fetch('/api/sign/qr-init', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_fullname: currentAuthUser })
+        });
+        const data = await res.json();
+        
+        document.getElementById('signQrImg').src = data.qrCode;
+        
+        pollInterval = setInterval(async () => {
+            const stRes = await fetch(`/api/sign/qr-status/${data.qrSessionId}`);
+            const stData = await stRes.json();
+            
+            if (stData.status === 'COMPLETED') {
+                clearInterval(pollInterval);
+                document.getElementById('signQrBox').style.display = 'none';
+                document.getElementById('signResult').style.display = 'block';
+                
+                document.getElementById('jsonDoc').innerText = JSON.stringify(stData.document, null, 2);
+                document.getElementById('cmsSignature').innerText = stData.full_signature;
+                document.getElementById('cryptoStatus').innerText = stData.verification.details;
+            }
+        }, 2000);
+    }
+</script>
+
+</body>
+</html>
+
+
+3. Инструкция по запуску и тестированию
+
+Установите зависимости:
+
+pip install -r requirements.txt
+
+
+Запустите веб-сервер:
+
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+
+Откройте в браузере: http://localhost:8000
+
+Проведите тест:
+
+Нажмите Кнопка № 1 («Авторизоваться через eGov Mobile»).
+
+Откройте приложение eGov Mobile на смартфоне, выберите сканер QR-кодов и отсканируйте код с экрана.
+
+Подтвердите вход. На странице отобразится ваше реальное ФИО.
+
+Нажмите Кнопка № 2 («Подписать тестовый голос»).
+
+Отсканируйте новый QR-код в eGov Mobile и подтвердите подписание документа.
+
+Убедитесь, что сервер успешно получил ЭЦП и вывел подтверждение криптографической валидности подписи.

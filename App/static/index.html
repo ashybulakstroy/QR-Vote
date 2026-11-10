@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Этап 0 — eGov Mobile QR Vote</title>
+    <style>
+        :root {
+            --bg: #eef2f7;
+            --card: #ffffff;
+            --text: #1e293b;
+            --muted: #64748b;
+            --primary: #2563eb;
+            --primary-dark: #1d4ed8;
+            --success: #059669;
+            --danger: #dc2626;
+            --warning: #d97706;
+            --border: #e2e8f0;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 24px 16px 48px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .page { max-width: 760px; margin: 0 auto; }
+
+        header { margin-bottom: 20px; }
+        header h1 { font-size: 22px; margin: 0 0 6px; }
+        header p { margin: 0; color: var(--muted); font-size: 14px; }
+
+        .card {
+            background: var(--card);
+            border-radius: 14px;
+            padding: 22px;
+            margin-bottom: 18px;
+            box-shadow: 0 4px 18px rgba(15, 23, 42, 0.07);
+        }
+
+        .card h2 {
+            font-size: 17px;
+            margin: 0 0 14px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card.disabled { opacity: 0.55; }
+
+        button {
+            font: inherit;
+            font-weight: 600;
+            border: 0;
+            border-radius: 9px;
+            padding: 12px 18px;
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+
+        button:disabled { cursor: not-allowed; opacity: 0.6; }
+
+        .btn-primary { background: var(--primary); color: #fff; width: 100%; }
+        .btn-primary:not(:disabled):hover { background: var(--primary-dark); }
+
+        .btn-secondary {
+            background: #e2e8f0;
+            color: var(--text);
+            padding: 8px 12px;
+            font-size: 13px;
+        }
+
+        .hint { color: var(--muted); font-size: 13px; margin-top: 10px; }
+
+        .qr-area {
+            display: none;
+            margin-top: 16px;
+            padding: 18px;
+            border: 1px dashed #cbd5e1;
+            border-radius: 12px;
+            background: #f8fafc;
+            text-align: center;
+        }
+
+        .qr-area.visible { display: block; }
+
+        .qr-area img {
+            width: 230px;
+            max-width: 100%;
+            background: #fff;
+            border-radius: 10px;
+            padding: 8px;
+            border: 1px solid var(--border);
+        }
+
+        .status {
+            margin-top: 14px;
+            padding: 11px 14px;
+            border-radius: 9px;
+            font-size: 14px;
+            line-height: 1.45;
+            background: #eff6ff;
+            color: #1e40af;
+        }
+
+        .status.success { background: #ecfdf5; color: #065f46; }
+        .status.warning { background: #fffbeb; color: #92400e; }
+        .status.error { background: #fef2f2; color: #991b1b; }
+
+        .result { display: none; margin-top: 16px; }
+        .result.visible { display: block; }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: minmax(120px, auto) 1fr;
+            gap: 7px 16px;
+            font-size: 14px;
+        }
+
+        .info-grid dt { color: var(--muted); }
+        .info-grid dd { margin: 0; font-weight: 600; word-break: break-word; }
+
+        .checks { list-style: none; margin: 12px 0 0; padding: 0; font-size: 14px; }
+        .checks li { padding: 5px 0; }
+        .checks .ok::before { content: "✓ "; color: var(--success); font-weight: 800; }
+        .checks .fail::before { content: "✗ "; color: var(--danger); font-weight: 800; }
+        .checks .skip::before { content: "• "; color: var(--muted); font-weight: 800; }
+
+        details { margin-top: 14px; }
+        summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+
+        pre {
+            margin: 10px 0 0;
+            padding: 14px;
+            border-radius: 9px;
+            background: #0f172a;
+            color: #93c5fd;
+            font-size: 12px;
+            line-height: 1.45;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+        .link { color: var(--primary); font-size: 14px; font-weight: 600; }
+
+        footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }
+        footer code { background: #e2e8f0; padding: 2px 6px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+<div class="page">
+    <header>
+        <h1>Этап 0 — проверка eGov Mobile QR</h1>
+        <p>Авторизация и подписание тестового голоса через приложение eGov Mobile (SIGEX).</p>
+    </header>
+
+    <section class="card" id="authCard">
+        <h2>Шаг 1. Авторизация</h2>
+        <button class="btn-primary" id="authButton">Авторизоваться через eGov Mobile</button>
+        <div class="hint">Нажмите кнопку, затем отсканируйте QR-код в приложении eGov Mobile.</div>
+
+        <div class="qr-area" id="authQrArea">
+            <img id="authQrImage" alt="QR-код для авторизации">
+            <div class="row" style="justify-content: center;">
+                <a class="link" id="authLaunchLink" href="#" target="_blank" rel="noopener" style="display: none;">Открыть eGov Mobile на этом устройстве</a>
+            </div>
+        </div>
+
+        <div class="status" id="authStatus" style="display: none;"></div>
+
+        <div class="result" id="authResult">
+            <dl class="info-grid">
+                <dt>ФИО</dt><dd id="authFullname">—</dd>
+                <dt>ИИН</dt><dd id="authIin">—</dd>
+                <dt>Организация</dt><dd id="authOrganization">—</dd>
+                <dt>Проверка ЭЦП</dt><dd id="authVerification">—</dd>
+            </dl>
+        </div>
+    </section>
+
+    <section class="card disabled" id="signCard">
+        <h2>Шаг 2. Подписание тестового голоса</h2>
+        <button class="btn-primary" id="signButton" disabled>Подписать тестовый голос</button>
+        <div class="hint" id="signHint">Сначала выполните авторизацию на шаге 1.</div>
+
+        <div class="qr-area" id="signQrArea">
+            <img id="signQrImage" alt="QR-код для подписания">
+            <div class="row" style="justify-content: center;">
+                <a class="link" id="signLaunchLink" href="#" target="_blank" rel="noopener" style="display: none;">Открыть eGov Mobile на этом устройстве</a>
+            </div>
+        </div>
+
+        <div class="status" id="signStatus" style="display: none;"></div>
+
+        <div class="result" id="signResult">
+            <div class="status success" id="verificationBanner">ЭЦП проверена.</div>
+            <ul class="checks" id="verificationChecks"></ul>
+
+            <dl class="info-grid" style="margin-top: 14px;">
+                <dt>Подписант</dt><dd id="signerName">—</dd>
+                <dt>ИИН / БИН</dt><dd id="signerIdentifier">—</dd>
+                <dt>Алгоритм</dt><dd id="signatureAlgorithm">—</dd>
+                <dt>Действие сертификата</dt><dd id="certificateValidity">—</dd>
+                <dt>Файл результата</dt><dd id="savedFile">—</dd>
+            </dl>
+
+            <details open>
+                <summary>Подписанный документ</summary>
+                <pre id="documentJson"></pre>
+            </details>
+
+            <details>
+                <summary>ЭЦП (CMS / PKCS#7, base64)</summary>
+                <div class="row">
+                    <button class="btn-secondary" id="copySignature">Скопировать подпись</button>
+                </div>
+                <pre id="signatureBase64"></pre>
+            </details>
+
+            <div class="row">
+                <button class="btn-secondary" id="resetButton">Начать заново</button>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        Значения <code>HOST</code> и <code>PORT</code> читаются из <code>.env</code>. Результаты сохраняются в <code>data/vote</code>.
+    </footer>
+</div>
+
+<script>
+    "use strict";
+
+    const state = {
+        authUser: null,
+        authIin: null,
+        authTimer: null,
+        signTimer: null,
+        signature: null,
+    };
+
+    const el = (id) => document.getElementById(id);
+
+    function setStatus(target, text, kind = "info") {
+        const node = el(target);
+        if (!text) {
+            node.style.display = "none";
+            node.textContent = "";
+            return;
+        }
+        node.className = "status" + (kind === "info" ? "" : " " + kind);
+        node.textContent = text;
+        node.style.display = "block";
+    }
+
+    function setVisible(node, visible) {
+        node.classList.toggle("visible", visible);
+    }
+
+    async function requestJson(url, options = {}) {
+        const response = await fetch(url, options);
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch (error) {
+            payload = null;
+        }
+        if (!response.ok) {
+            const detail = payload && payload.detail ? payload.detail : "HTTP " + response.status;
+            throw new Error(detail);
+        }
+        return payload;
+    }
+
+    function stopTimer(name) {
+        if (state[name]) {
+            clearTimeout(state[name]);
+            state[name] = null;
+        }
+    }
+
+    function statusText(status) {
+        switch (status) {
+            case "pending": return ["Ожидание сканирования QR-кода…", "info"];
+            case "data_sent": return ["Данные переданы в eGov Mobile. Подтвердите действие в приложении…", "info"];
+            case "canceled": return ["Действие отменено в eGov Mobile.", "warning"];
+            case "expired": return ["Срок действия QR-кода истёк. Создайте новый.", "warning"];
+            default: return ["Обработка…", "info"];
+        }
+    }
+
+    function pollSession(sessionId, timerName, onUpdate) {
+        const tick = async () => {
+            try {
+                const data = await requestJson("/api/sessions/" + encodeURIComponent(sessionId));
+                const terminal = ["completed", "canceled", "error", "expired"].includes(data.status);
+                if (onUpdate(data, terminal)) return;
+                if (terminal) return;
+                state[timerName] = setTimeout(tick, 2000);
+            } catch (error) {
+                setStatus(timerName === "authTimer" ? "authStatus" : "signStatus", error.message, "error");
+                if (timerName === "authTimer") {
+                    el("authButton").disabled = false;
+                } else {
+                    el("signButton").disabled = false;
+                }
+            }
+        };
+        tick();
+    }
+
+    function showQr(imageId, linkId, areaId, session) {
+        el(imageId).src = "data:image/png;base64," + session.qr_code;
+        const link = el(linkId);
+        if (session.launch_link) {
+            link.href = session.launch_link;
+            link.style.display = "inline";
+        } else {
+            link.style.display = "none";
+        }
+        setVisible(el(areaId), true);
+    }
+
+    function hideQr(areaId) {
+        setVisible(el(areaId), false);
+    }
+
+    function describeVerification(verification) {
+        if (!verification) return "нет данных";
+        if (verification.valid === true) return "действительна";
+        if (verification.valid === false) return "недействительна";
+        if (verification.supported === false) return "ограничена (алгоритм ГОСТ)";
+        return "не проверена";
+    }
+
+    function verificationKind(verification) {
+        if (!verification) return "warning";
+        if (verification.valid === true) return "success";
+        if (verification.valid === false) return "error";
+        return "warning";
+    }
+
+    function renderChecks(verification) {
+        const list = el("verificationChecks");
+        list.textContent = "";
+        if (!verification) return;
+
+        const checks = verification.checks || {};
+        const rows = [
+            ["Соответствие подписи документу", checks.digest_matches],
+            ["Криптографическая подпись", checks.signature_valid],
+            ["Срок действия сертификата", checks.certificate_valid_now],
+            ["Сертификат найден в CMS", checks.certificate_matches_signer],
+        ];
+
+        rows.forEach(([label, value]) => {
+            const item = document.createElement("li");
+            let cls = "skip";
+            let mark = "—";
+            if (value === true) { cls = "ok"; mark = ""; }
+            if (value === false) { cls = "fail"; mark = ""; }
+            item.className = cls;
+            item.textContent = label + (mark ? " (" + mark + ")" : "");
+            list.appendChild(item);
+        });
+    }
+
+    async function startAuth() {
+        stopTimer("authTimer");
+        state.authUser = null;
+        state.authIin = null;
+
+        el("authButton").disabled = true;
+        el("authResult").classList.remove("visible");
+        hideQr("authQrArea");
+        setStatus("authStatus", "Регистрация сессии в SIGEX…", "info");
+
+        try {
+            const session = await requestJson("/api/auth/init", { method: "POST" });
+            showQr("authQrImage", "authLaunchLink", "authQrArea", session);
+            setStatus("authStatus", statusText("pending")[0], "info");
+
+            pollSession(session.session_id, "authTimer", (data, terminal) => {
+                if (data.status === "pending" || data.status === "data_sent") {
+                    const [text, kind] = statusText(data.status);
+                    setStatus("authStatus", text, kind);
+                    return false;
+                }
+                if (data.status === "completed") {
+                    onAuthCompleted(data);
+                    return true;
+                }
+                hideQr("authQrArea");
+                const [text, kind] = statusText(data.status);
+                setStatus("authStatus", data.error || text, kind);
+                el("authButton").disabled = false;
+                return true;
+            });
+        } catch (error) {
+            setStatus("authStatus", "Не удалось создать QR: " + error.message, "error");
+            el("authButton").disabled = false;
+        }
+    }
+
+    function onAuthCompleted(data) {
+        stopTimer("authTimer");
+        hideQr("authQrArea");
+        setStatus("authStatus", "Авторизация успешна.", "success");
+
+        const user = data.user || {};
+        state.authUser = user.common_name || null;
+        state.authIin = user.iin || null;
+
+        el("authFullname").textContent = user.common_name || "—";
+        el("authIin").textContent = user.iin || "—";
+        el("authOrganization").textContent = user.organization || "—";
+        el("authVerification").textContent = describeVerification(data.verification);
+        el("authResult").classList.add("visible");
+
+        el("signCard").classList.remove("disabled");
+        el("signButton").disabled = false;
+        el("signHint").textContent = "Пользователь подтверждён. Теперь можно подписать тестовый голос.";
+    }
+
+    async function startSigning() {
+        if (!state.authUser) return;
+
+        stopTimer("signTimer");
+        el("signButton").disabled = true;
+        el("signResult").classList.remove("visible");
+        hideQr("signQrArea");
+        setStatus("signStatus", "Формирование документа и QR-кода…", "info");
+
+        try {
+            const session = await requestJson("/api/sign/init", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ user_fullname: state.authUser, iin: state.authIin }),
+            });
+
+            el("documentJson").textContent = JSON.stringify(session.document, null, 2);
+            showQr("signQrImage", "signLaunchLink", "signQrArea", session);
+            setStatus("signStatus", statusText("pending")[0], "info");
+
+            pollSession(session.session_id, "signTimer", (data, terminal) => {
+                if (data.status === "pending" || data.status === "data_sent") {
+                    const [text, kind] = statusText(data.status);
+                    setStatus("signStatus", text, kind);
+                    return false;
+                }
+                if (data.status === "completed") {
+                    onSignCompleted(data);
+                    return true;
+                }
+                hideQr("signQrArea");
+                const [text, kind] = statusText(data.status);
+                setStatus("signStatus", data.error || text, kind);
+                el("signButton").disabled = false;
+                return true;
+            });
+        } catch (error) {
+            setStatus("signStatus", "Не удалось создать QR: " + error.message, "error");
+            el("signButton").disabled = false;
+        }
+    }
+
+    function onSignCompleted(data) {
+        stopTimer("signTimer");
+        hideQr("signQrArea");
+        setStatus("signStatus", "Подписание завершено.", "success");
+
+        const verification = data.verification || {};
+        const banner = el("verificationBanner");
+        banner.className = "status " + verificationKind(verification);
+        banner.textContent = verification.details || "Проверка ЭЦП завершена.";
+
+        renderChecks(verification);
+
+        const signer = verification.signer || {};
+        el("signerName").textContent = signer.common_name || "—";
+        el("signerIdentifier").textContent = signer.iin || signer.bin || "—";
+        el("signatureAlgorithm").textContent = verification.signature_algorithm_name || "—";
+        const certificate = verification.certificate || {};
+        el("certificateValidity").textContent = certificate.valid_now === true
+            ? "действует до " + (certificate.not_after || "—")
+            : (certificate.valid_now === false ? "недействителен" : "—");
+        el("savedFile").textContent = data.saved_file || "—";
+
+        el("documentJson").textContent = JSON.stringify(data.document, null, 2);
+        state.signature = data.signature || "";
+        el("signatureBase64").textContent = state.signature || "—";
+
+        el("signResult").classList.add("visible");
+    }
+
+    function resetAll() {
+        stopTimer("authTimer");
+        stopTimer("signTimer");
+        state.authUser = null;
+        state.authIin = null;
+        state.signature = null;
+
+        hideQr("authQrArea");
+        hideQr("signQrArea");
+        setStatus("authStatus", null);
+        setStatus("signStatus", null);
+        el("authResult").classList.remove("visible");
+        el("signResult").classList.remove("visible");
+
+        el("authButton").disabled = false;
+        el("signButton").disabled = true;
+        el("signCard").classList.add("disabled");
+        el("signHint").textContent = "Сначала выполните авторизацию на шаге 1.";
+        el("documentJson").textContent = "";
+        el("signatureBase64").textContent = "";
+    }
+
+    el("authButton").addEventListener("click", startAuth);
+    el("signButton").addEventListener("click", startSigning);
+    el("resetButton").addEventListener("click", resetAll);
+    el("copySignature").addEventListener("click", async () => {
+        if (!state.signature) return;
+        try {
+            await navigator.clipboard.writeText(state.signature);
+            el("copySignature").textContent = "Скопировано";
+            setTimeout(() => { el("copySignature").textContent = "Скопировать подпись"; }, 1500);
+        } catch (error) {
+            setStatus("signStatus", "Не удалось скопировать подпись: " + error.message, "warning");
+        }
+    });
+</script>
+</body>
+</html>
